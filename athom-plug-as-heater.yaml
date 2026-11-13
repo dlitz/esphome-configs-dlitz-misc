@@ -1,0 +1,409 @@
+substitutions:
+  name: athom-plug-as-heater
+  friendly_name: athom-smart-plug as heater
+  #temperature_sensor_mac_address: "d5:3a:46:06:51:52"   # workshop-heater-temphum
+  temperature_sensor_mac_address: "42:00:00:00:00:42"   # dummy address that does not exist.  Fill this in with something that starts with d5:3a:46:...
+  ipv6_enable: "true"
+  power_plug_type: "power-socket-us"
+  wifi_fast_connect: "true"
+  relay_restore_mode: ALWAYS_OFF
+  timezone: "America/Edmonton"
+
+# These ensure the appropriate secrets, which are used in !include files,
+# are passed to a remote esphome-device-builder.
+.secrets_used:
+  - !secret heater_ap_password
+  # - !secret heater_ota_password
+  - !secret heater_web_username
+  - !secret heater_web_password
+
+packages:
+  Athom_Technology.Smart_Plug_V3: "github://dlitz/athom-esp32-configs/athom-smart-plug.yaml"
+  dlitz-misc.git-branch: !include common/git-branch.yaml
+
+dashboard_import:
+  package_import_url: github://dlitz/esphome-configs-dlitz-misc/athom-plug-as-heater.yaml@${git_branch}${"#refresh=" + git_refresh if git_refresh else ""}
+
+esp32:
+  framework:
+    advanced:
+      flash_chip: generic   # saves IRAM by selecting the specific flash driver needed for this hardware
+
+esphome:
+  name: ${name}
+  name_add_mac_suffix: true
+  friendly_name: ${friendly_name}
+  project:
+    name: "dlitz-misc.athom-plug-as-heater"
+    version: "v0.0.0"
+  includes:
+    - "<sstream>"
+api:
+  on_client_connected: !remove
+  on_client_disconnected: !remove
+  encryption:
+
+provisioning:
+  id: provisioning_id
+  timeout: 300s
+  on_timeout:
+    then:
+      - logger.log: "Provisioning window closed; reset the device to reopen it"
+
+ota:
+  - platform: esphome
+    # password: !secret heater_ota_password
+  - id: !remove ota_http_request
+http_request: !remove
+update:
+  - id: !remove update_http_request
+
+wifi:
+  #ssid: !secret wifi_ssid
+  #password: !secret wifi_password
+  enable_btm: true
+  enable_rrm: true
+  min_auth_mode: WPA2
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    password: !secret heater_ap_password
+
+safe_mode:
+  reboot_timeout: 10min
+
+globals:
+  - id: !extend restore_mode
+    restore_value: no
+    initial_value: "0"  # 0 = Always_Off
+
+select:
+  - id: !extend power_mode
+    internal: true
+
+light:
+  - id: !extend blue_led
+    disabled_by_default: false
+    entity_category: diagnostic
+
+#web_server: !remove
+web_server:
+  version: 3
+  id: webserver_id
+  auth:
+    type: digest
+    username: !secret heater_web_username
+    password: !secret heater_web_password
+
+bluetooth_proxy: !remove
+
+esp32_ble_tracker:
+  scan_parameters: !remove
+  on_ble_advertise:
+    - mac_address: "${temperature_sensor_mac_address}"
+      then:
+        - lambda: |-
+            for (auto data : x.get_manufacturer_datas()) {
+                if (data.data.size() == 12) {
+                    float temperature = (float(data.data[8] & 0x0F) * 0.1) + float(data.data[9] & 0x7F);
+                    if (!(data.data[9] & 0x80)) {
+                        temperature = -temperature;
+                    }
+                    ESP_LOGD("switchbot-hygro", "Got temperature & humidity data");
+                    id(remote_temperature).publish_state(temperature);
+                    id(remote_humidity).publish_state(data.data[10] & 0x7F);
+                }
+            }
+            for (auto data : x.get_service_datas()) {
+                if (data.data.size() == 3) {
+                    int8_t battery_pct = data.data[2] & 0x7F;
+                    ESP_LOGD("switchbot-hygro", "Got battery state");
+                    id(remote_battery).publish_state(battery_pct);
+                }
+            }
+
+script:
+  - id: update_heater_slow_pwm
+    mode: restart
+    parameters:
+      want_heat: bool
+    then:
+      lambda: |-
+        float time_on_seconds = id(duty_on_minutes_number).state * 60;
+        float time_off_seconds = id(duty_off_minutes_number).state * 60;
+        float period_seconds = time_on_seconds + time_off_seconds;
+        if (std::isnan(time_on_seconds) || std::isnan(time_off_seconds)) {
+          ESP_LOGE("main.update_heater_slow_pwm", "configuration duty time isnan");
+        } else if (period_seconds == 0.0) {
+          ESP_LOGE("main.update_heater_slow_pwm", "period is zero");
+        } else {
+          float duty_cycle = time_on_seconds / period_seconds;
+          unsigned int period_milliseconds = (unsigned int)(period_seconds * 1000);
+          ESP_LOGI("main.update_heater_slow_pwm", "want_heat: %d", want_heat);
+          if (want_heat) {
+            id(heater_slow_pwm).set_period(period_milliseconds);
+            id(heater_slow_pwm).set_level(duty_cycle);
+            ESP_LOGD("main.update_heater_slow_pwm", "Set heater_slow_pwm period: %.03fs, duty cycle: %.3f", period_seconds, duty_cycle);
+          } else {
+            id(heater_slow_pwm).turn_off();
+            ESP_LOGD("main.update_heater_slow_pwm", "Turned off");
+          }
+          // This is more reliable than setting restart_cycle_on_state_change
+          // on the slow_pwm since SlowPWMOutput::set_period() doesn't trigger
+          // any state-change callbacks.
+          id(heater_slow_pwm).restart_cycle();
+          ESP_LOGD("main.update_heater_slow_pwm", "Restarted cycle");
+        }
+
+binary_sensor:
+  - platform: template
+    id: relay_is_on
+    name: "Relay"
+    lambda: |-
+      return id(relay).state;
+
+  - id: !extend power_button
+    disabled_by_default: false
+
+  - platform: template
+    id: want_heat
+    name: "Want heat"
+    entity_category: diagnostic
+    lambda: |-
+      using namespace esphome::climate;
+      switch (id(thermostat_id).action) {
+        case ClimateAction::CLIMATE_ACTION_HEATING:
+          return true;
+        case ClimateAction::CLIMATE_ACTION_IDLE:
+          return false;
+        default:
+          return {};
+      }
+    on_state_change:
+      - if:
+          condition:
+            lambda: "return x.has_value();"
+          then:
+            - script.execute:
+                id: update_heater_slow_pwm
+                want_heat: "x.value()"
+
+switch:
+  - id: !extend relay
+    name: "Relay switch"
+    device_class: outlet
+    entity_category: diagnostic
+    disabled_by_default: true
+
+output:
+  - platform: slow_pwm
+    id: heater_slow_pwm
+    period: 1s     # Dummy value
+    turn_on_action:
+      - switch.turn_on: relay
+    turn_off_action:
+      - switch.turn_off: relay
+    restart_cycle_on_state_change: false
+
+
+number:
+  - platform: template
+    id: duty_on_minutes_number
+    name: Duty ON time
+    entity_category: config
+    device_class: duration
+    mode: box
+    optimistic: true
+    update_interval: never
+    unit_of_measurement: min
+    min_value: 0.01
+    max_value: 1440         # 24 hours
+    step: 0.01
+    initial_value: 180      # 3 hours
+    restore_value: true
+    set_action:
+      - script.execute:
+          id: update_heater_slow_pwm
+          want_heat: !lambda "return id(want_heat).state;"
+
+  - platform: template
+    id: duty_off_minutes_number
+    name: Duty OFF time
+    entity_category: config
+    device_class: duration
+    mode: box
+    optimistic: true
+    restore_value: true
+    update_interval: never
+    unit_of_measurement: min
+    min_value: 0            # 0 disables
+    max_value: 1440         # 24 hours
+    step: 0.01
+    initial_value: 30
+    set_action:
+      - script.execute:
+          id: update_heater_slow_pwm
+          want_heat: !lambda "return id(want_heat).state;"
+
+
+text_sensor:
+  - platform: template
+    name: App state string
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: |-
+      auto state = App.get_app_state();
+      std::ostringstream ss;
+      switch(state & STATUS_LED_MASK) {
+        case STATUS_LED_OK: ss << "OK"; break;
+        case STATUS_LED_WARNING: ss << "WARNING"; break;
+        case STATUS_LED_ERROR: ss << "ERROR"; break;
+        default: ss << (state & STATUS_LED_MASK);
+      }
+      if (state & ~STATUS_LED_MASK) {
+        ss << "|" << (state & ~STATUS_LED_MASK);
+      }
+      return {ss.str()};
+
+sensor:
+  - platform: internal_temperature
+    name: "CPU temperature"
+
+  - platform: template
+    name: App state (uint8)
+    entity_category: diagnostic
+    lambda: |-
+      return App.get_app_state();
+    update_interval: 1s
+
+  - platform: template
+    name: "Remote sensor Temperature"
+    id: remote_temperature
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    # icon: "mdi:thermometer"
+    # entity_category: diagnostic
+    on_value:
+      then:
+        - component.update: remote_absolute_humidity
+        - component.update: remote_dew_point
+        - component.update: remote_vapor_pressure_deficit
+    filters:
+      - timeout: 10min
+
+  - platform: template
+    name: "Remote sensor Humidity"
+    id: remote_humidity
+    device_class: humidity
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    # icon: "mdi:water-percent"
+    # entity_category: diagnostic
+    on_value:
+      then:
+        - component.update: remote_absolute_humidity
+        - component.update: remote_dew_point
+        - component.update: remote_vapor_pressure_deficit
+    filters:
+      - timeout: 10min
+
+  - platform: template
+    name: "Remote sensor Battery"
+    id: remote_battery
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    # icon: "mdi:battery"
+    # entity_category: diagnostic
+    filters:
+      - timeout: 70min
+
+  - platform: template
+    name: "Remote sensor Absolute Humidity"
+    id: remote_absolute_humidity
+    device_class: absolute_humidity
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 2
+    # icon: "mdi:water"
+    update_interval: never    # updated explicitly when dependencies are updated
+    # entity_category: diagnostic
+    lambda: |-
+      if (id(remote_temperature).state != NAN && id(remote_humidity).state != NAN) {
+        float temp = id(remote_temperature).state;
+        float rh = id(remote_humidity).state;
+        return (6.112 * exp((17.67 * temp) / (temp + 243.5)) * rh * 2.1674) / (273.15 + temp);
+      } else {
+        return NAN;
+      }
+
+  - platform: template
+    name: "Remote sensor Dew Point"
+    id: remote_dew_point
+    device_class: temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    icon: "mdi:thermometer-water"
+    update_interval: never    # updated explicitly when dependencies are updated
+    # entity_category: diagnostic
+    lambda: |-
+      if (id(remote_temperature).state != NAN && id(remote_humidity).state != NAN) {
+        float temp = id(remote_temperature).state;
+        float rh = id(remote_humidity).state;
+        float ln_rh = log(rh / 100.0);
+        return (243.5 * (ln_rh + (17.67 * temp) / (temp + 243.5))) / (17.67 - ln_rh - (243.5 / temp));
+      } else {
+        return NAN;
+      }
+
+  - platform: template
+    name: "Remote sensor Vapor Pressure Deficit"
+    id: remote_vapor_pressure_deficit
+    device_class: pressure
+    unit_of_measurement: "kPa"
+    accuracy_decimals: 2
+    icon: "mdi:waves-arrow-up"
+    update_interval: never    # updated explicitly when dependencies are updated
+    # entity_category: diagnostic
+    lambda: |-
+      if (id(remote_temperature).state != NAN && id(remote_humidity).state != NAN) {
+        float temp = id(remote_temperature).state;
+        float rh = id(remote_humidity).state;
+        float es = 6.112 * exp((17.67 * temp) / (temp + 243.5));
+        float vpd = (1.0 - (rh / 100.0)) * es;
+        return vpd / 10.0; // Convert from hPa to kPa
+      } else {
+        return NAN;
+      }
+
+climate:
+  - platform: thermostat
+    id: thermostat_id
+    name: "Thermostat"
+    min_idle_time: 2s
+    #min_heating_off_time: 300s #  DEBUG FIXME(root)   
+    #min_heating_run_time: 300s
+    min_heating_off_time: 1s
+    min_heating_run_time: 1s
+    sensor: remote_temperature
+    humidity_sensor: remote_humidity
+    idle_action:
+      - logger.log: "CLIMATE: idle_action executing"
+    heat_action:
+      # We trigger actions on the want_heat binary sensor
+      - logger.log: "CLIMATE: heat_action executing"
+    default_preset: Home
+    on_boot_restore_from: memory
+    heat_deadband: 0.25
+    heat_overrun: 0.75
+    preset:
+      - name: Home
+        default_target_temperature_low:  20°C
+        mode: heat
+    visual:
+      min_temperature: 5°C
+      max_temperature: 50°C
+      temperature_step: 0.5°C
